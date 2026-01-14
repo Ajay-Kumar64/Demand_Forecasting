@@ -1,0 +1,13 @@
+pandas
+numpy
+pyarrow
+scikit-learn
+lightgbm
+optuna
+h3
+geopandas
+shap
+pyyaml
+fastapi
+uvicorn
+joblib
