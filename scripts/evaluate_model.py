@@ -25,10 +25,9 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.modeling.train import (          # noqa: E402
+from src.modeling.train import (  # add predict_quantiles to this import
     load_sparse_demand, build_grid, build_feature_layers, chronological_splits,
-    build_matrix, as_lgb_frame, slot_bucket, wape, pinball, FEATURE_NAMES,
-    LAG_HISTORY_SLOTS,
+    build_matrix, predict_quantiles, slot_bucket, wape, pinball, FEATURE_NAMES,
 )
 
 def main():
@@ -64,10 +63,7 @@ def main():
     yte = D[c2:].ravel().astype(np.float32)
     n_test = D.shape[0] - c2
 
-    p10 = models[0.1].predict(as_lgb_frame(Xte))
-    p50 = models[0.5].predict(as_lgb_frame(Xte))
-    p90 = models[0.9].predict(as_lgb_frame(Xte))
-
+    p10, p50, p90 = predict_quantiles(models, Xte)
     print("\n================ SAME TEST WINDOW ================")
     print(f"Copy last 15min  WAPE: {wape(yte, F['demand_t-15m'][c2:].ravel())*100:.2f}%")
     print(f"Copy last hour   WAPE: {wape(yte, F['demand_t-1h'][c2:].ravel())*100:.2f}%")
