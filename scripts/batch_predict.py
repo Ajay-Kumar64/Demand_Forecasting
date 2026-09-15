@@ -20,9 +20,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.modeling.train import (          # noqa: E402
+from src.modeling.train import (  # add predict_quantiles
     load_sparse_demand, build_grid, build_feature_layers,
-    build_matrix, as_lgb_frame, slot_bucket, LAG_HISTORY_SLOTS,
+    build_matrix, predict_quantiles, slot_bucket, LAG_HISTORY_SLOTS,
 )
 
 def main():
@@ -61,10 +61,7 @@ def main():
     n_cells = D.shape[1]
 
     X = build_matrix(F, slotvec, cell_mean, start_i, end_i, n_cells)
-    q10 = np.maximum(models[0.1].predict(as_lgb_frame(X)), 0)
-    q50 = np.maximum(models[0.5].predict(as_lgb_frame(X)), 0)
-    q90 = np.maximum(models[0.9].predict(as_lgb_frame(X)), 0)
-
+    q10, q50, q90 = predict_quantiles(models, X)    
     n_range = end_i - start_i
     out = pd.DataFrame({
         "h3_cell": np.tile(cells, n_range),
