@@ -16,15 +16,28 @@ def validate_columns(df: pd.DataFrame):
 
 
 def add_time_bucket(df: pd.DataFrame) -> pd.DataFrame:
+    # TLC pickups are local wall-clock time. Nov fall-back makes 1:00-1:59 AM
+    # occur twice; naive flooring double-counts it. Localize -> convert to
+    # UTC -> drop tz -> floor, so every 15-min slot is unique and true.
+    df = df.sort_values("tpep_pickup_datetime")
+    ts = pd.to_datetime(df["tpep_pickup_datetime"]).dt.tz_localize(
+        "America/New_York", ambiguous="infer", nonexistent="shift_forward"
+    )
     df["ts_15min"] = (
-        pd.to_datetime(df["tpep_pickup_datetime"])
-        .dt.floor("15min")
+        ts.dt.tz_convert("UTC").dt.tz_localize(None).dt.floor("15min")
     )
     return df
 
 
 def add_h3_from_zone(df: pd.DataFrame, zone_lookup: dict) -> pd.DataFrame:
-    df["h3_cell"] = df["PULocationID"].map(zone_lookup)
+    mapped = df["PULocationID"].map(zone_lookup)
+    n_dropped = int(mapped.isna().sum())
+    if n_dropped:
+        pct = n_dropped / len(df) * 100
+        top = df.loc[mapped.isna(), "PULocationID"].value_counts().head(5).to_dict()
+        print(f"[DATA-QUALITY] dropping {n_dropped:,}/{len(df):,} rows ({pct:.2f}%) "
+              f"with unmapped PULocationID (264/265 etc.); top: {top}")
+    df["h3_cell"] = mapped
     return df.dropna(subset=["h3_cell"])
 
 
