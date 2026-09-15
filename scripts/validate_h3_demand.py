@@ -5,7 +5,7 @@ from src.validation.h3_demand_validator import (
     validate_schema,
     validate_no_nulls,
     validate_h3_resolution,
-    validate_trip_counts,
+    validate_demand_values,      # was validate_trip_counts
     validation_summary,
 )
 
@@ -20,8 +20,8 @@ def main(path: str, h3_res: int):
     print("[VALIDATE] nulls")
     validate_no_nulls(df)
 
-    print("[VALIDATE] trip counts")
-    validate_trip_counts(df)
+    print("[VALIDATE] demand values")
+    validate_demand_values(df)   # was validate_trip_counts(df)
 
     print("[VALIDATE] h3 resolution")
     validate_h3_resolution(df, expected_res=h3_res)
