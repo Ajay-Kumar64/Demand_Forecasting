@@ -1,16 +1,12 @@
+"""Data-quality checks for the H3 demand feature store."""
 from __future__ import annotations
 
-import pandas as pd
-import h3
 from typing import Dict
 
+import h3
+import pandas as pd
 
-REQUIRED_COLUMNS = {
-    "date",
-    "hour",
-    "h3_cell",
-    "trip_count",
-}
+REQUIRED_COLUMNS = {"h3_cell", "ts_15min", "demand"}
 
 
 def validate_schema(df: pd.DataFrame) -> None:
@@ -20,7 +16,7 @@ def validate_schema(df: pd.DataFrame) -> None:
 
 
 def validate_no_nulls(df: pd.DataFrame) -> None:
-    nulls = df[REQUIRED_COLUMNS].isnull().any()
+    nulls = df[list(REQUIRED_COLUMNS)].isnull().any()
     bad_cols = nulls[nulls].index.tolist()
     if bad_cols:
         raise ValueError(f"Null values found in columns: {bad_cols}")
@@ -28,12 +24,7 @@ def validate_no_nulls(df: pd.DataFrame) -> None:
 
 def validate_h3_resolution(df: pd.DataFrame, expected_res: int) -> None:
     sample_cells = df["h3_cell"].dropna().unique()[:100]
-
-    bad = []
-    for cell in sample_cells:
-        if h3.get_resolution(cell) != expected_res:
-            bad.append(cell)
-
+    bad = [c for c in sample_cells if h3.get_resolution(c) != expected_res]
     if bad:
         raise ValueError(
             f"H3 resolution mismatch. Expected={expected_res}, "
@@ -41,15 +32,19 @@ def validate_h3_resolution(df: pd.DataFrame, expected_res: int) -> None:
         )
 
 
-def validate_trip_counts(df: pd.DataFrame) -> None:
-    if (df["trip_count"] <= 0).any():
-        raise ValueError("Found non-positive trip counts")
+def validate_demand_values(df: pd.DataFrame) -> None:
+    """Demand counts must be non-negative. Zero is VALID (empty cell-slots
+    are the point of the zero-filled grid — the old validator rejected them)."""
+    if (df["demand"] < 0).any():
+        raise ValueError("Found negative demand values")
 
 
-def validation_summary(df: pd.DataFrame) -> Dict[str, int]:
+def validation_summary(df: pd.DataFrame) -> Dict:
     return {
         "rows": len(df),
-        "unique_h3_cells": df["h3_cell"].nunique(),
-        "total_trips": int(df["trip_count"].sum()),
-        "days": df["date"].nunique(),
+        "unique_h3_cells": int(df["h3_cell"].nunique()),
+        "total_demand": int(df["demand"].sum()),
+        "zero_slot_share": round(float((df["demand"] == 0).mean()), 4),
+        "t_min": str(pd.to_datetime(df["ts_15min"]).min()),
+        "t_max": str(pd.to_datetime(df["ts_15min"]).max()),
     }
