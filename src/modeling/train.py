@@ -172,7 +172,18 @@ def as_lgb_frame(X: np.ndarray) -> pd.DataFrame:
     df = pd.DataFrame(X, columns=FEATURE_NAMES, copy=False)
     df["cell_id"] = df["cell_id"].astype(np.int32)     # BUG-9: integer categorical codes
     return df
-
+  
+def predict_quantiles(models, X):
+    """Predict q10/q50/q90. Per-row rearrangement fixes quantile crossing
+    (independently trained quantile models can invert), then clips at zero.
+    Order: sort -> clip. Guarantees 0 <= q10 <= q50 <= q90, conf_width >= 0."""
+    if isinstance(X, np.ndarray):
+        X = as_lgb_frame(X)
+    P = np.stack([models[a].predict(X) for a in ALPHAS], axis=1)
+    P = np.sort(P, axis=1)          # BUG-6
+    P = np.maximum(P, 0.0)          # DEC-A (after sort)
+    return P[:, 0], P[:, 1], P[:, 2]
+  
 # ----------------------------- training -----------------------------
 def train_models(Xtr, ytr, Xca, yca) -> dict:
     dtr = lgb.Dataset(Xtr, ytr, feature_name=FEATURE_NAMES,
@@ -236,11 +247,10 @@ def main():
     models = train_models(as_lgb_frame(Xtr), ytr, as_lgb_frame(Xca), yca)
 
     # quick self-check on the holdout so one command reproduces the headline
-    p50 = models[0.5].predict(as_lgb_frame(Xte))
+    p10, p50, p90 = predict_quantiles(models, Xte)
     print("\n===== HOLDOUT SELF-CHECK =====")
     print(f"Test WAPE (q50):      {wape(yte, p50) * 100:.2f}%")
     print(f"Test Pinball q50:     {pinball(yte, p50, 0.5):.4f}")
-    p10, p90 = models[0.1].predict(as_lgb_frame(Xte)), models[0.9].predict(as_lgb_frame(Xte))
     print(f"Test Coverage 10-90:  {np.mean((yte >= p10) & (yte <= p90)) * 100:.2f}%")
 
     meta = {
