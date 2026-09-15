@@ -2,12 +2,9 @@ pandas
 numpy
 pyarrow
 scikit-learn
-lightgbm
-optuna
-h3
+lightgbm>=4.0
+h3>=4.0
 geopandas
-shap
-pyyaml
-fastapi
-uvicorn
-joblib
+shapely
+matplotlib
+requests
