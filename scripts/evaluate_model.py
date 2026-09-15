@@ -1,147 +1,130 @@
-#---------------------------
-#USING COLAB FOR EVALUATION
-#-------------------------
+"""
+Out-of-time evaluation against trained artifacts.
 
-import pandas as pd
+Evaluates ONLY the chronological holdout (never training data), reports the
+verdict table (model vs 4 baselines on the identical window), pinball loss,
+aggregate + conditional coverage, reliability, per-cell WAPE, and importance.
+
+Run:  python -m scripts.evaluate_model \
+        --demand-parquet data/feature_store/h3_demand_2025.parquet \
+        --models-dir artifacts/models
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pickle
+import sys
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import pickle  # Use pickle for models saved with pickle.dump
-import seaborn as sns
-from tqdm.notebook import tqdm  # Import tqdm for progress bar
-import time  # Import time for ETA calculation
 
-# ------------------------------
-# 1. Load data and model
-# ------------------------------
-DATA_PATH = "/content/drive/MyDrive/demand_forecasting/h3_features_2025.parquet"
-MODEL_PATH = "/content/drive/MyDrive/demand_forecasting/lgbm_quantile_models.pkl"
-df = pd.read_parquet(DATA_PATH)
-with open(MODEL_PATH, 'rb') as f:
-    models_dict = pickle.load(f)  # Rename 'model' to 'models_dict' to reflect its structure
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Drop target for features
-X = df.drop(columns=['demand', 'ts_15min',
-                     'h3_cell'])  # Ensure 'ts_15min' and 'h3_cell' are dropped for prediction if they were not features during training
-y_true = df['demand'].values
+from src.modeling.train import (          # noqa: E402
+    load_sparse_demand, build_grid, build_feature_layers, chronological_splits,
+    build_matrix, as_lgb_frame, slot_bucket, wape, pinball, FEATURE_NAMES,
+    LAG_HISTORY_SLOTS,
+)
 
-# ------------------------------
-# 2. Predict quantiles
-# ------------------------------
-quantiles = [0.1, 0.5, 0.9]
-preds = {}
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--demand-parquet", default="data/feature_store/h3_demand_2025.parquet")
+    ap.add_argument("--models-dir", default="artifacts/models")
+    ap.add_argument("--out-dir", default="artifacts/eval")
+    args = ap.parse_args()
 
-print("\n[PREDICTING] Quantile predictions with ETA...")
-for q in quantiles:
-    print(f"  Predicting for Quantile alpha={q}")
-    quantile_models = models_dict[q]
+    models_dir, out_dir = Path(args.models_dir), Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    q_preds_list = []
-    start_time_quantile = time.time()
+    meta = json.loads((models_dir / "train_meta.json").read_text())
+    with open(models_dir / "lgbm_quantile_models.pkl", "rb") as f:
+        models = pickle.load(f)
+    cell_mean = np.load(models_dir / "cell_mean.npy")
+    profile = np.load(models_dir / "profile_dowhour.npy")
+    cells = json.loads((models_dir / "cells.json").read_text())
 
-    for i, model in enumerate(tqdm(quantile_models, desc=f"    Models for q={q}", leave=False)):
-        q_preds_list.append(model.predict(X))
+    # rebuild the identical grid; abort if data changed since training
+    sparse = load_sparse_demand(Path(args.demand_parquet))
+    D, _, ts_slots = build_grid(sparse)
+    del sparse
+    if D.shape[0] != meta["n_slots"] or str(ts_slots[0])[:19] != str(meta["t0"])[:19]:
+        raise RuntimeError("Grid changed since training — re-run src.modeling.train first.")
 
-    q_preds = np.array(q_preds_list)
-    preds[q] = np.mean(q_preds, axis=0)
+    F, slotvec = build_feature_layers(D, ts_slots)
+    F["cell_dowhour_mean"] = profile[slot_bucket(ts_slots), :]   # train-derived lookup
 
-    end_time_quantile = time.time()
-    time_taken_quantile = end_time_quantile - start_time_quantile
-    print(f"    Quantile {q} prediction completed in {time_taken_quantile:.2f} seconds.")
+    _, _, c2 = chronological_splits(D.shape[0])
+    n_cells = D.shape[1]
+    Xte = build_matrix(F, slotvec, cell_mean, c2, D.shape[0], n_cells)
+    yte = D[c2:].ravel().astype(np.float32)
+    n_test = D.shape[0] - c2
 
-print("[PREDICTING] All quantile predictions completed.")
+    p10 = models[0.1].predict(as_lgb_frame(Xte))
+    p50 = models[0.5].predict(as_lgb_frame(Xte))
+    p90 = models[0.9].predict(as_lgb_frame(Xte))
 
+    print("\n================ SAME TEST WINDOW ================")
+    print(f"Copy last 15min  WAPE: {wape(yte, F['demand_t-15m'][c2:].ravel())*100:.2f}%")
+    print(f"Copy last hour   WAPE: {wape(yte, F['demand_t-1h'][c2:].ravel())*100:.2f}%")
+    print(f"Copy last week   WAPE: {wape(yte, F['demand_t-168h'][c2:].ravel())*100:.2f}%")
+    print(f"Cheat sheet      WAPE: {wape(yte, F['cell_dowhour_mean'][c2:].ravel())*100:.2f}%")
+    print(f"YOUR MODEL       WAPE: {wape(yte, p50)*100:.2f}%")
+    print("--------------------------------------------------")
+    print(f"Pinball q10/q50/q90: {pinball(yte,p10,.1):.3f} / "
+          f"{pinball(yte,p50,.5):.3f} / {pinball(yte,p90,.9):.3f}")
+    cov = float(np.mean((yte >= p10) & (yte <= p90)))
+    print(f"Coverage (q10-q90):  {cov*100:.2f}%  (nominal 80%)")
 
-# ------------------------------
-# 3. Pinball Loss
-# ------------------------------
-def pinball_loss(y_true, y_pred, q):
-    delta = y_true - y_pred
-    return np.mean(np.maximum(q * delta, (q - 1) * delta))
+    # conditional coverage: aggregate coverage can hide bucket-level failure
+    width = p90 - p10
+    bins = np.digitize(yte, [0.5, 4.5, 19.5])   # 0 / 1-4 / 5-19 / 20+
+    print("\n--- Conditional coverage by true-demand bucket ---")
+    print(f"{'bucket':>8} | {'n':>9} | {'coverage':>8} | {'mean width':>10}")
+    for b, label in enumerate(["=0", "1-4", "5-19", "20+"]):
+        m = bins == b
+        if m.any():
+            print(f"{label:>8} | {m.sum():>9,} | {np.mean((yte[m]>=p10[m])&(yte[m]<=p90[m]))*100:>7.2f}% | "
+                  f"{width[m].mean():>10.2f}")
 
+    # reliability (empirical fraction below each predicted quantile)
+    print("\n--- Reliability ---")
+    for q, p in [(0.1, p10), (0.5, p50), (0.9, p90)]:
+        print(f"predicted q{int(q*100)}: empirical fraction below = {np.mean(yte <= p):.3f}")
 
-print("\n=== Pinball Loss ===")
-for q in quantiles:
-    loss = pinball_loss(y_true, preds[q], q)
-    print(f"q{int(q * 100)}: {loss:.4f}")
+    # per-cell WAPE (row = slot-major, so cell index = row % n_cells)
+    cell_idx = np.tile(np.arange(n_cells), n_test)
+    abs_err = np.abs(yte - p50)
+    err_sum = np.bincount(cell_idx, weights=abs_err, minlength=n_cells)
+    dem_sum = np.bincount(cell_idx, weights=yte, minlength=n_cells)
+    wape_cell = pd.DataFrame({"h3_cell": np.array(cells), "abs_err": err_sum,
+                              "demand": dem_sum})
+    wape_cell["WAPE"] = wape_cell["abs_err"] / wape_cell["demand"]
+    print("\nTop 10 H3 cells by WAPE:")
+    print(wape_cell.sort_values("WAPE", ascending=False).head(10).to_string(index=False))
 
-# ------------------------------
-# 4. Prediction Interval Coverage
-# ------------------------------
-# % of true values inside q10-q90 interval
-lower = preds[0.1]
-upper = preds[0.9]
-coverage = np.mean((y_true >= lower) & (y_true <= upper))
-print(f"\nPrediction Interval (10-90%) Coverage: {coverage * 100:.2f}%")
+    imp = pd.Series(models[0.5].feature_importance("gain"), index=FEATURE_NAMES)
+    print("\nTop 10 features (gain):")
+    print(imp.sort_values(ascending=False).head(10).to_string())
 
-# Interval width distribution
-plt.figure(figsize=(8, 4))
-sns.histplot(upper - lower, bins=30, kde=True)
-plt.title("Distribution of Prediction Interval Widths (q10-q90)")
-plt.xlabel("Width")
-plt.ylabel("Count")
-plt.show()
+    # plots (headless-safe)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(width, bins=30)
+    ax.set_title("Prediction Interval Widths (q10-q90), holdout")
+    fig.savefig(out_dir / "interval_width_hist.png", dpi=120, bbox_inches="tight")
 
+    fig, ax = plt.subplots(figsize=(5, 5))
+    qs = [0.1, 0.5, 0.9]
+    ax.plot([0, 1], [0, 1], "k--", label="Perfect")
+    ax.plot(qs, [np.mean(yte <= p) for p in (p10, p50, p90)], "o-", label="Model")
+    ax.set_xlabel("Predicted quantile"); ax.set_ylabel("Empirical fraction below")
+    ax.set_title("Reliability diagram (holdout)"); ax.legend()
+    fig.savefig(out_dir / "reliability.png", dpi=120, bbox_inches="tight")
+    print(f"\n[PLOTS] saved -> {out_dir}")
 
-# ------------------------------
-# 5. Calibration Check (Reliability)
-# ------------------------------
-def calibration(y_true, y_pred_quantiles, quantiles):
-    actual_frac = []
-    for q in quantiles:
-        frac = np.mean(y_true <= y_pred_quantiles[q])
-        actual_frac.append(frac)
-    return actual_frac
-
-
-actual_frac = calibration(y_true, preds, quantiles)
-
-plt.figure(figsize=(6, 6))
-plt.plot([0, 1], [0, 1], 'k--', label='Perfect')
-plt.plot(quantiles, actual_frac, marker='o', label='Model')
-plt.xlabel("Predicted Quantile")
-plt.ylabel("Fraction Below Prediction")
-plt.title("Reliability Diagram (Calibration)")
-plt.legend()
-plt.show()
-
-# ------------------------------
-# 6. WAPE (Weighted Absolute Percentage Error)
-# ------------------------------
-y_pred_median = preds[0.5]
-wape = np.sum(np.abs(y_true - y_pred_median)) / np.sum(y_true)
-print(f"\nOverall WAPE: {wape * 100:.2f}%")
-
-# WAPE per H3 cell
-wape_cell = df.copy()
-wape_cell['pred'] = y_pred_median
-wape_cell['abs_err'] = np.abs(wape_cell['demand'] - wape_cell['pred'])
-wape_per_cell = wape_cell.groupby('h3_cell').agg({'abs_err': 'sum', 'demand': 'sum'})
-wape_per_cell['WAPE'] = wape_per_cell['abs_err'] / wape_per_cell['demand']
-
-# Show top 10 worst cells
-print("\nTop 10 H3 cells by WAPE:")
-print(wape_per_cell.sort_values('WAPE', ascending=False).head(10))
-
-# ------------------------------
-# 7. Time Series Plot Example
-# ------------------------------
-# Plot actual vs predicted for a random H3 cell
-example_cell = df['h3_cell'].iloc[0]
-df_cell = df[df['h3_cell'] == example_cell].copy()
-
-# Extract features for the example cell
-X_example_cell = df_cell.drop(columns=['demand', 'ts_15min', 'h3_cell'])
-
-# Predict median for the example cell using the averaged 0.5 quantile predictions
-df_cell['pred_median'] = preds[0.5][
-    df['h3_cell'] == example_cell]  # Select predictions corresponding to the example cell
-df_cell = df_cell.sort_values('ts_15min')
-
-plt.figure(figsize=(12, 4))
-plt.plot(df_cell['ts_15min'], df_cell['demand'], label='Actual', marker='o')
-plt.plot(df_cell['ts_15min'], df_cell['pred_median'], label='Predicted (Median)', marker='x')
-plt.title(f"H3 Cell {example_cell} Actual vs Predicted")
-plt.xlabel("Timestamp")
-plt.ylabel("Demand")
-plt.legend()
-plt.show()
+if __name__ == "__main__":
+    main()
